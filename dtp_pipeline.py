@@ -225,8 +225,8 @@ DEFAULT_CONFIG = {
         # NEW: put a logo in the center of the footer instead of left text,
         # and push the page number into a page corner. Leave "logo" empty
         # ("") to fall back to the old left-text-plus-page-number layout.
-        "logo": os.path.join(ASSETS_DIR, "logo_sikshana.png"),
-        "logo_height_cm": 0.7,
+        "logo": os.path.join(ASSETS_DIR, "logo_sikshana_2.png"),
+        "logo_height_cm": 0.5,
         "page_number_corner": "right",   # "right" or "left"
     },
 }
@@ -780,15 +780,24 @@ def build(input_path, output_path, cfg, tmp_dir,
         p.paragraph_format.keep_with_next = True
         add_bottom_border(p, color=tcfg.get('color', PAL['primary']), sz=14)
 
-    def style_heading(p, text):
+    def style_heading(p, text, icon_image_path=None):
         hcfg = STY.get('section_heading', {})
         core_lower = strip_lead_numbering(text).lower()
-        icon = ''
-        for kw, glyph in HEADING_ICONS.items():
-            if core_lower.startswith(kw):
-                icon = glyph
-                break
-        r = p.add_run(icon + text)
+        used_real_icon = False
+        if icon_image_path:
+            try:
+                icon_h = Pt(hcfg.get('font_size_pt', 13) * 1.35)
+                p.add_run().add_picture(icon_image_path, height=icon_h)
+                p.add_run('  ')
+                used_real_icon = True
+            except Exception:
+                used_real_icon = False
+        if not used_real_icon:
+            for kw, glyph in HEADING_ICONS.items():
+                if core_lower.startswith(kw):
+                    text = glyph + text
+                    break
+        r = p.add_run(text)
         set_font(r, FONT, size=hcfg.get('font_size_pt', 13),
                   bold=(hcfg.get('font_weight', 'bold') == 'bold'),
                   color=hexcolor(hcfg.get('color', PAL['secondary'])))
@@ -963,6 +972,7 @@ def build(input_path, output_path, cfg, tmp_dir,
     image_counter = 0
     callout_active = False
     callout_items = []
+    pending_image = None  # {'path': ..., 'w_emu':..., 'h_emu':...} awaiting the next block
     stats = {'title': 0, 'heading': 0, 'subheading': 0, 'objective': 0,
               'dialogue_para': 0, 'body': 0, 'images': 0, 'callout': 0,
               'table_vocab': 0, 'table_dialogue': 0, 'table_wordgrid': 0,
@@ -976,8 +986,34 @@ def build(input_path, output_path, cfg, tmp_dir,
         callout_active = False
         callout_items = []
 
+    def flush_pending_image():
+        """Render a buffered image as a normal standalone centered picture
+        (used when no heading immediately follows it after all)."""
+        nonlocal pending_image
+        if not pending_image:
+            return
+        cfn = pending_image['path']
+        w_emu, h_emu = pending_image['w_emu'], pending_image['h_emu']
+        p = out.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        try:
+            run = p.add_run()
+            max_w = Cm(6.0)
+            if w_emu and h_emu:
+                if Emu(w_emu) > max_w:
+                    ratio = h_emu / w_emu
+                    run.add_picture(cfn, width=max_w, height=Emu(int(max_w * ratio)))
+                else:
+                    run.add_picture(cfn, width=Emu(w_emu), height=Emu(h_emu))
+            else:
+                run.add_picture(cfn, width=Cm(1.2))
+        except Exception:
+            pass
+        pending_image = None
+
     body = src_doc.element.body
-    for child in body.iterchildren():
+    children = list(body.iterchildren())
+    for child in children:
         tag = child.tag.split('}')[-1]
 
         if tag == 'p':
@@ -987,6 +1023,13 @@ def build(input_path, output_path, cfg, tmp_dir,
             if not text:
                 blob, w_emu, h_emu = get_image_blob(src_doc, child)
                 if blob:
+                    # A small standalone icon-like image: hold it instead of
+                    # placing it immediately -- if a section heading comes
+                    # right after it (the common "icon above the heading"
+                    # pattern from the source docx), it gets attached as a
+                    # small inline icon beside that heading instead of
+                    # floating on its own oversized line.
+                    flush_pending_image()
                     image_counter += 1
                     stats['images'] += 1
                     fn = os.path.join(tmp_dir, f'img_{image_counter}_orig.png')
@@ -995,21 +1038,7 @@ def build(input_path, output_path, cfg, tmp_dir,
                     cropped_fn = os.path.join(tmp_dir, f'img_{image_counter}.png')
                     cfn, cw, ch, ow, oh = autocrop_image_file(fn, cropped_fn)
                     w_emu, h_emu = cropped_extent(w_emu, h_emu, ow, oh, cw, ch)
-                    p = out.add_paragraph()
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    try:
-                        run = p.add_run()
-                        max_w = Cm(6.0)
-                        if w_emu and h_emu:
-                            if Emu(w_emu) > max_w:
-                                ratio = h_emu / w_emu
-                                run.add_picture(cfn, width=max_w, height=Emu(int(max_w * ratio)))
-                            else:
-                                run.add_picture(cfn, width=Emu(w_emu), height=Emu(h_emu))
-                        else:
-                            run.add_picture(cfn, width=Cm(1.2))
-                    except Exception:
-                        pass
+                    pending_image = {'path': cfn, 'w_emu': w_emu, 'h_emu': h_emu}
                 continue
 
             src_bold_para = any(r.bold for r in para.runs if r.text.strip())
@@ -1020,12 +1049,14 @@ def build(input_path, output_path, cfg, tmp_dir,
                 flush_callout()
 
             if kind == 'title':
+                flush_pending_image()
                 p = out.add_paragraph()
                 style_title(p, text)
                 last_heading_type = 'title'
                 stats['title'] += 1
 
             elif kind == 'objective_inline':
+                flush_pending_image()
                 p = out.add_paragraph()
                 m = re.match(r'^((?:Objective|Learning Objective)\s*:)\s*(.*)$', text, re.IGNORECASE)
                 style_objective(p, m.group(1), m.group(2))
@@ -1034,7 +1065,9 @@ def build(input_path, output_path, cfg, tmp_dir,
 
             elif kind == 'heading':
                 p = out.add_paragraph()
-                style_heading(p, text)
+                icon_path = pending_image['path'] if pending_image else None
+                style_heading(p, text, icon_image_path=icon_path)
+                pending_image = None  # consumed as the heading's icon (or none pending)
                 last_heading_type = 'heading'
                 stats['heading'] += 1
                 if any(core_lower.startswith(kw) for kw in CALLOUT_TRIGGERS):
@@ -1042,6 +1075,7 @@ def build(input_path, output_path, cfg, tmp_dir,
                     callout_items = []
 
             elif kind == 'subheading':
+                flush_pending_image()
                 if callout_active:
                     callout_items.append((text, True, False))
                 else:
@@ -1050,6 +1084,7 @@ def build(input_path, output_path, cfg, tmp_dir,
                 stats['subheading'] += 1
 
             elif kind == 'dialogue_para':
+                flush_pending_image()
                 if callout_active:
                     callout_items.append((text, False, True))
                 else:
@@ -1058,6 +1093,7 @@ def build(input_path, output_path, cfg, tmp_dir,
                 stats['dialogue_para'] += 1
 
             else:
+                flush_pending_image()
                 if callout_active:
                     callout_items.append((text, src_bold_para, False))
                     stats['body'] += 1
@@ -1067,6 +1103,7 @@ def build(input_path, output_path, cfg, tmp_dir,
                     stats['body'] += 1
 
         elif tag == 'tbl':
+            flush_pending_image()
             flush_callout()
             t = Table(child, src_doc)
             kind = classify_table(t)
@@ -1176,6 +1213,7 @@ def build(input_path, output_path, cfg, tmp_dir,
             spacer = out.add_paragraph()
             para_spacing(spacer, 0, 6)
 
+    flush_pending_image()
     flush_callout()
 
     out.save(output_path)
